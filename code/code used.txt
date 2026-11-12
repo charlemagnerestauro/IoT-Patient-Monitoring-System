@@ -1,0 +1,377 @@
+#include <Wire.h> 
+#include "MAX30100_PulseOximeter.h"
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// ---------- BLYNK DEFINES ----------
+#define BLYNK_TEMPLATE_ID "TMPL6nsY-6CCF"
+#define BLYNK_TEMPLATE_NAME "PatientMonitor"
+#define BLYNK_AUTH_TOKEN "iDllnSQ3XPRM2Ds9JHeGL9CZvp5ZDomW"
+
+// ---------- BLYNK INCLUDES ----------
+#define BLYNK_PRINT Serial
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+
+// ---------- WIFI CREDENTIALS ----------
+char ssid[] = "ALHN-324A";
+char pass[] = "mAMR5sxdQP";
+
+// ---------- PIN DEFINITIONS ----------
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define DHT_PIN 19
+#define DS_PIN 18
+#define WARNING_LED 2
+#define BUZZER_PIN 15
+
+// ---------- MAX30100 ----------
+PulseOximeter pox;
+
+// ---------- DHT22 ----------
+#define DHTTYPE DHT22
+DHT dht(DHT_PIN, DHTTYPE);
+
+// ---------- DS18B20 ----------
+OneWire oneWire(DS_PIN);
+DallasTemperature bodyTempSensor(&oneWire);
+
+// ---------- OLED ----------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire);
+
+// ---------- TIMING VARIABLES ----------
+uint32_t lastDHTRead = 0;
+uint32_t lastDSRead = 0;
+uint32_t lastDisplay = 0;
+uint32_t lastBlynkSend = 0;  
+
+// ---------- SENSOR VARIABLES ----------
+float roomTemp = 0, roomHum = 0;
+float bodyTemp = 0;
+
+// ---------- AVERAGING VARIABLES ----------
+const int measurementTime = 20000; // 20 seconds
+float hrSum = 0, spSum = 0;
+int hrCount = 0, spCount = 0;
+bool countdownStarted = false;
+bool measuring = false;
+bool showAverage = false;
+uint32_t countdownStartTime = 0;
+float lastHrAvg = 0, lastSpAvg = 0;
+
+// ---------- NOTIFICATION FLAGS ----------
+bool hrAlarmSent = false;
+bool feverAlarmSent = false;
+bool roomTempAlarmSent = false;
+bool lhrAlarmSent = false;
+
+// ---------------------------------------------------------
+//        ** FIX FOR MAX30100 FREEZE ADDED HERE **
+// ---------------------------------------------------------
+unsigned long lastHRtime = 0;
+const unsigned long HR_TIMEOUT = 3000;   // 3 seconds
+// ---------------------------------------------------------
+
+// ---------- CALLBACK ----------
+void onBeatDetected() {
+  Serial.println("❤️ Beat detected!");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // ---------- Wi-Fi ----------
+  WiFi.begin(ssid, pass);
+  uint32_t startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 5000) {
+    delay(100);
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("Wi-Fi connected. Starting Blynk...");
+    Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+  } else {
+    Serial.println("Wi-Fi not connected. Running offline mode.");
+  }
+
+  // ---------- MAX30100 ----------
+  if (!pox.begin()) {
+    Serial.println("FAILED to initialize MAX30100. Check wiring/power!");
+    while (1);
+  }
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+
+  // ---------- DHT22 ----------
+  dht.begin();
+
+  // ---------- DS18B20 ----------
+  bodyTempSensor.begin();
+
+  // ---------- OLED ----------
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed");
+    while (1);
+  }
+  display.clearDisplay();
+
+  pinMode(WARNING_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+}
+
+void loop() {
+
+  pox.update();
+  uint32_t now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) Blynk.run();
+
+  float currentHR = pox.getHeartRate();
+  float currentSpO2 = pox.getSpO2();
+
+  // ---------------------------------------------------------
+  //     ** FIX — refresh heartbeat timestamp **
+  // ---------------------------------------------------------
+  if (currentHR > 0) lastHRtime = now;
+  // ---------------------------------------------------------
+
+  // ---------------------------------------------------------
+  //   ** FIX — Automatic recovery for MAX30100 freeze **
+  // ---------------------------------------------------------
+  if (now - lastHRtime > HR_TIMEOUT) {
+      Serial.println("MAX30100 unresponsive — resetting I2C & sensor...");
+
+      Wire.end();
+      delay(10);
+      Wire.begin(SDA_PIN, SCL_PIN);
+      delay(10);
+
+      pox.begin();
+      pox.setOnBeatDetectedCallback(onBeatDetected);
+
+      lastHRtime = now;
+  }
+  // ---------------------------------------------------------
+
+  // ---------- DHT22 every 2s ----------
+  if (now - lastDHTRead >= 2000) {
+    pox.update();
+    roomTemp = dht.readTemperature();
+    roomHum = dht.readHumidity();
+    lastDHTRead = now;
+  }
+
+  // ---------- DS18B20 every 1s ----------
+  if (now - lastDSRead >= 1000) {
+    pox.update();
+    bodyTempSensor.requestTemperatures();
+    bodyTemp = bodyTempSensor.getTempCByIndex(0) + 1.5;
+    lastDSRead = now;
+  }
+
+  // ---------- Combined Alarm Logic ----------
+  if (showAverage && lastHrAvg > 90 ) {
+    digitalWrite(WARNING_LED, HIGH);
+    if ((now / 200) % 2 == 0) tone(BUZZER_PIN, 2500);
+    else noTone(BUZZER_PIN);
+
+    if (WiFi.status() == WL_CONNECTED && !hrAlarmSent) {
+      Blynk.logEvent("hr_alert", "High Heart Rate " + String(lastHrAvg, 1) + " bpm");
+      hrAlarmSent = true;
+    }
+
+  } 
+  
+  else if (showAverage && lastHrAvg < 60 ) {
+    digitalWrite(WARNING_LED, HIGH);
+    if ((now / 200) % 2 == 0) tone(BUZZER_PIN, 2500);
+    else noTone(BUZZER_PIN);
+
+    if (WiFi.status() == WL_CONNECTED && !hrAlarmSent) {
+      Blynk.logEvent("low_hr_alert", "Low Heart Rate " + String(lastHrAvg, 1) + " bpm");
+      lhrAlarmSent = true;
+    }
+
+  }
+  
+  else if (bodyTemp > 34.5) {
+    digitalWrite(WARNING_LED, HIGH);
+    if ((now / 200) % 2 == 0) tone(BUZZER_PIN, 2500);
+    else noTone(BUZZER_PIN);
+
+    if (WiFi.status() == WL_CONNECTED && !feverAlarmSent) {
+      Blynk.logEvent("fever_alert", "Fever " + String(bodyTemp, 1) + "°C");
+      feverAlarmSent = true;
+    }
+
+  } else if (roomTemp > 33.5) {
+  digitalWrite(WARNING_LED, HIGH);
+  if ((now / 200) % 2 == 0) tone(BUZZER_PIN, 2500);
+  else noTone(BUZZER_PIN);
+
+  if (WiFi.status() == WL_CONNECTED && !roomTempAlarmSent) {
+    Blynk.logEvent("room_temp_alert", 
+      "High Room Temp " + String(roomTemp, 1) + " C");
+    roomTempAlarmSent = true;
+  }
+} else {
+    digitalWrite(WARNING_LED, LOW);
+    noTone(BUZZER_PIN);
+    hrAlarmSent = false;
+    feverAlarmSent = false;
+    roomTempAlarmSent = false; 
+  }
+
+  // ---------- Countdown Start ----------
+  if (!countdownStarted && currentHR > 0 && currentSpO2 > 0) {
+    countdownStarted = true;
+    measuring = true;
+    countdownStartTime = now;
+    hrSum = spSum = 0;
+    hrCount = spCount = 0;
+    showAverage = false;
+  }
+
+  // ---------- Averaging ----------
+  if (measuring) {
+    if (currentHR > 0 && currentSpO2 > 0) {
+      hrSum += currentHR;
+      hrCount++;
+      spSum += currentSpO2;
+      spCount++;
+    }
+
+    if (now - countdownStartTime >= measurementTime) {
+      measuring = false;
+      showAverage = true;
+
+      lastHrAvg = (hrCount > 0) ? hrSum / hrCount : 0;
+      lastSpAvg = (spCount > 0) ? spSum / spCount : 0;
+      if (lastSpAvg > 100) lastSpAvg = 100;
+
+Serial.print("AVG HR = "); Serial.print(lastHrAvg);
+Serial.print(" | AVG SpO2 = "); Serial.println(lastSpAvg);
+
+
+      if (WiFi.status() == WL_CONNECTED) {
+        Blynk.virtualWrite(V4, lastHrAvg);
+        Blynk.virtualWrite(V5, lastSpAvg);
+      }
+    }
+  }
+
+  // ---------- Periodic Blynk send (10s) ----------
+  if (now - lastBlynkSend >= 10000) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Blynk.virtualWrite(V1, roomTemp);
+      Blynk.virtualWrite(V2, roomHum);
+      Blynk.virtualWrite(V3, bodyTemp);
+    }
+    lastBlynkSend = now;
+  }
+
+  int remainingTime = countdownStarted ? (measurementTime - (now - countdownStartTime)) / 1000 : 20;
+  if (remainingTime < 0) remainingTime = 0;
+
+  // ---------- OLED ----------
+  if (now - lastDisplay >= 500) {
+
+    pox.update();
+    display.clearDisplay();
+
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.print("R.T: "); display.print(roomTemp); display.print("C");
+    display.setCursor(64,0);
+    display.print("R.H: "); display.print(roomHum); display.print("%");
+
+    display.setCursor(0,12);
+    display.print("B.T: "); display.print(bodyTemp); display.print("C");
+
+    if (bodyTemp > 37.5) {
+      display.setCursor(64,12);
+      display.print(" FEVER!");
+    }
+
+    display.drawLine(0,22,128,22,SSD1306_WHITE);
+
+    display.setTextSize(2);
+    display.setCursor(0,24);
+
+    if (!countdownStarted) {
+      display.setTextSize(1);
+      display.setCursor(0,30);
+      display.print("Place your");
+      display.setCursor(0,42);
+      display.print("finger");
+
+    } else if (measuring) {
+      display.print("Measuring: ");
+      display.print(remainingTime);
+      display.print("s");
+
+      if ((millis() / 500) % 2 == 0) {
+        int x = 110, y = 50, size = 4;
+        display.fillCircle(x, y, size, SSD1306_WHITE);
+        display.fillCircle(x + size, y, size, SSD1306_WHITE);
+        display.fillTriangle(x - size, y, x + size*2, y, x + size/2, y + size*2, SSD1306_WHITE);
+      }
+
+    } 
+
+    else if (showAverage) {
+
+  // HR
+  display.setTextSize(1);
+  display.setCursor(0, 30);  // align similar to "Place your finger"
+  display.print("HR: ");
+  display.print(lastHrAvg, 0);
+  display.print(" bpm");
+
+  // SpO2
+  display.setTextSize(1);
+  display.setCursor(0, 42);  // position below HR
+  display.print("SpO2: ");
+  display.print(lastSpAvg, 0);
+  display.print("%");
+}
+
+
+// ---------- OLED ALERT LINE ----------
+display.setTextSize(1);
+display.setCursor(0, 56);   // fixed bottom line
+
+if (showAverage && lastHrAvg > 90) {
+  display.print("ALERT: HIGH HR!");
+}
+
+else if (showAverage && lastHrAvg < 60) {
+  display.print("ALERT: LOW HR!");
+}
+
+else if (roomTemp > 33.5) {
+  display.print("ALERT: HOT ROOM!");
+}
+else if (bodyTemp > 34.5) {
+  display.print("ALERT: FEVER!");
+}
+
+
+
+    display.display();
+    pox.update();
+    lastDisplay = now;
+  }
+
+  // ---------- Reset for next measurement ----------
+  if (!measuring && showAverage && (now - countdownStartTime >= measurementTime + 5000)) {
+    countdownStarted = false;
+    showAverage = false;
+  }
+
+}
